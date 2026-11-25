@@ -22,7 +22,7 @@ import { HealthScoreModal } from './components/HealthScoreModal';
 import { NotificationsModal } from './components/NotificationsModal';
 import { SecurityModal } from './components/SecurityModal';
 import { LoadingScreen } from './components/LoadingScreen';
-import { ShieldCheck, ArrowRight } from 'lucide-react';
+import { ShieldCheck, ArrowRight, Bot } from 'lucide-react';
 
 const INITIAL_USER: UserProfile = {
   name: 'New User',
@@ -341,13 +341,17 @@ export default function App() {
 
   const handleLoginSuccess = (userProfile?: Partial<UserProfile>, isNewAccount: boolean = false) => {
     if (userProfile && Object.keys(userProfile).length > 0) {
-      setUser((prev) => ({
-        ...prev,
-        ...userProfile,
-        healthScore: isNewAccount ? 100 : (userProfile.healthScore ?? prev.healthScore),
-        rewardsPoints: isNewAccount ? 0 : (userProfile.rewardsPoints ?? prev.rewardsPoints),
-        streakDays: isNewAccount ? 0 : (userProfile.streakDays ?? prev.streakDays),
-      }));
+      setUser((prev) => {
+        const updated = {
+          ...prev,
+          ...userProfile,
+          healthScore: isNewAccount ? 100 : (userProfile.healthScore ?? prev.healthScore),
+          rewardsPoints: isNewAccount ? 0 : (userProfile.rewardsPoints ?? prev.rewardsPoints),
+          streakDays: isNewAccount ? 0 : (userProfile.streakDays ?? prev.streakDays),
+        };
+        localStorage.setItem('tracksy_user', JSON.stringify(updated));
+        return updated;
+      });
     }
 
     if (isNewAccount) {
@@ -374,7 +378,7 @@ export default function App() {
 
     setIsLoggedIn(true);
     localStorage.setItem('tracksy_logged_in', 'true');
-    if (userProfile?.isAdmin || userProfile?.role === 'admin' || userProfile?.email?.trim().toLowerCase() === 'admi@gmail.com') {
+    if (userProfile?.isAdmin || userProfile?.role === 'admin' || userProfile?.email?.trim().toLowerCase() === 'admi@gmail.com' || userProfile?.email?.trim().toLowerCase() === 'admin@gmail.com') {
       setAdminViewMode('dashboard');
     }
     setCurrentTab('home');
@@ -402,7 +406,7 @@ export default function App() {
   }
 
   // Admin Check
-  const isAdminLoggedIn = user.isAdmin || user.role === 'admin' || user.email === 'admi@gmail.com';
+  const isAdminLoggedIn = user.isAdmin || user.role === 'admin' || user.email === 'admi@gmail.com' || user.email === 'admin@gmail.com';
 
   // If Admin is logged in and in 'dashboard' mode, render the Admin Control Center
   if (isAdminLoggedIn && adminViewMode === 'dashboard') {
@@ -412,6 +416,7 @@ export default function App() {
         trackedUsers={trackedUsers}
         onUpdateTrackedUsers={(updated) => setTrackedUsers(updated)}
         onSwitchToUserMode={() => setAdminViewMode('preview')}
+        onLogout={handleSignOut}
       />
     );
   }
@@ -490,6 +495,20 @@ export default function App() {
           />
         )}
       </main>
+
+      {/* Floating AI Financial Bot Quick Launcher */}
+      {currentTab !== 'insights' && (
+        <button
+          type="button"
+          onClick={() => setCurrentTab('insights')}
+          aria-label="Ask Tracksy AI about expenses"
+          title="Ask Tracksy AI about expenses"
+          className="fixed bottom-24 right-5 z-40 w-12 h-12 rounded-2xl bg-gradient-to-tr from-indigo-600 via-purple-600 to-indigo-700 text-white flex items-center justify-center shadow-lg shadow-indigo-500/30 hover:scale-110 active:scale-95 transition group border border-white/20 cursor-pointer"
+        >
+          <Bot className="w-6 h-6 text-purple-100 group-hover:rotate-12 transition" />
+          <span className="absolute -top-1 -right-1 w-3.5 h-3.5 bg-emerald-400 border-2 border-white rounded-full animate-pulse" />
+        </button>
+      )}
 
       {/* Bottom Floating Navigation Bar */}
       <BottomNavBar

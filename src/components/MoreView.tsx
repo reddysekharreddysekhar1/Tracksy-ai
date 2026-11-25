@@ -94,7 +94,7 @@ export const MoreView: React.FC<MoreViewProps> = ({
             <h2 className="text-lg font-extrabold text-slate-900">{user.name}</h2>
             <p className="text-xs sm:text-sm text-slate-500 font-medium">{user.email}</p>
             <span className="inline-block mt-1 text-[10px] font-bold bg-indigo-100 text-indigo-700 px-2.5 py-0.5 rounded-full uppercase tracking-wider">
-              {user.email === 'admi@gmail.com' ? 'Super Admin' : 'Standard Member'}
+              {(user.isAdmin || user.role === 'admin' || user.email === 'admin@gmail.com' || user.email === 'admi@gmail.com') ? 'Super Admin' : 'Standard Member'}
             </span>
           </div>
         </div>

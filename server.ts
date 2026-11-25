@@ -1,14 +1,94 @@
 import express from "express";
 import path from "path";
 import dotenv from "dotenv";
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI, ThinkingLevel, Type } from "@google/genai";
 
 dotenv.config();
 
 const app = express();
 const PORT = 3000;
 
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "20mb" }));
+
+const PRIMARY_MODEL = "gemini-4-hydrogen";
+const FALLBACK_MODEL = "gemini-3.1-flash-lite";
+const TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
+
+const VALID_CATEGORIES = [
+  "Food",
+  "Transport",
+  "Shopping",
+  "Bills",
+  "Entertainment",
+  "Health",
+  "Travel",
+  "Other",
+] as const;
+
+type ValidCategory = (typeof VALID_CATEGORIES)[number];
+
+function normalizeCategory(raw?: string): ValidCategory {
+  if (!raw) return "Other";
+  const lower = raw.trim().toLowerCase();
+  const exact = VALID_CATEGORIES.find((c) => c.toLowerCase() === lower);
+  if (exact) return exact;
+  if (lower.includes("food") || lower.includes("dining") || lower.includes("cafe") || lower.includes("coffee") || lower.includes("grocery") || lower.includes("grocer") || lower.includes("restaurant")) return "Food";
+  if (lower.includes("transport") || lower.includes("cab") || lower.includes("taxi") || lower.includes("uber") || lower.includes("ola") || lower.includes("fuel") || lower.includes("metro") || lower.includes("bus")) return "Transport";
+  if (lower.includes("shop") || lower.includes("retail") || lower.includes("cloth") || lower.includes("mart") || lower.includes("amazon") || lower.includes("flipkart")) return "Shopping";
+  if (lower.includes("bill") || lower.includes("utilit") || lower.includes("electric") || lower.includes("water") || lower.includes("wifi") || lower.includes("internet") || lower.includes("rent") || lower.includes("recharge")) return "Bills";
+  if (lower.includes("entertain") || lower.includes("movie") || lower.includes("ott") || lower.includes("stream") || lower.includes("netflix") || lower.includes("spotify") || lower.includes("game")) return "Entertainment";
+  if (lower.includes("health") || lower.includes("med") || lower.includes("pharm") || lower.includes("doctor") || lower.includes("clinic") || lower.includes("gym")) return "Health";
+  if (lower.includes("travel") || lower.includes("flight") || lower.includes("hotel") || lower.includes("train") || lower.includes("trip")) return "Travel";
+  return "Other";
+}
+
+function safeParseJson<T = any>(rawText?: string): T {
+  const cleaned = (rawText || "")
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+  return JSON.parse(cleaned || "{}");
+}
+
+function formatGeminiError(error: any): { status: number; message: string } {
+  const msg = String(error?.message || error || "AI request failed");
+  const statusCode = Number(error?.status || error?.statusCode || 0);
+
+  if (msg.includes("GEMINI_API_KEY is not configured")) {
+    return {
+      status: 503,
+      message: "Gemini API key is not configured. Please check your key in Settings > Secrets.",
+    };
+  }
+  if (
+    statusCode === 403 ||
+    msg.includes("PERMISSION_DENIED") ||
+    msg.includes("API_KEY_INVALID") ||
+    msg.includes("API key not valid")
+  ) {
+    return {
+      status: 403,
+      message: "Gemini API key is invalid or lacks permission. Please verify your API key in Settings > Secrets.",
+    };
+  }
+  if (statusCode === 429 || msg.includes("RESOURCE_EXHAUSTED") || msg.includes("quota")) {
+    return {
+      status: 429,
+      message: "Gemini API rate limit reached. Please wait a moment and try again, or check your quota in Settings > Secrets.",
+    };
+  }
+  if (statusCode === 404 || msg.includes("NOT_FOUND")) {
+    return {
+      status: 502,
+      message: "Requested Gemini model is currently unavailable. Please try again shortly.",
+    };
+  }
+  return {
+    status: statusCode >= 400 && statusCode < 600 ? statusCode : 500,
+    message: msg,
+  };
+}
 
 // Initialize Gemini Client server-side
 const getGeminiClient = () => {
@@ -26,9 +106,83 @@ const getGeminiClient = () => {
   });
 };
 
+// Calls primary Gemini model with automatic retry/fallback to secondary valid Gemini model
+async function generateContentWithFallback(
+  ai: GoogleGenAI,
+  params: {
+    contents: any;
+    config?: Record<string, any>;
+    models?: string[];
+  }
+) {
+  const models = params.models || [PRIMARY_MODEL, FALLBACK_MODEL];
+  let lastError: any = null;
+
+  for (const model of models) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const config: Record<string, any> = { ...(params.config || {}) };
+        if (model === PRIMARY_MODEL && !config.thinkingConfig) {
+          config.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
+        }
+        const response = await ai.models.generateContent({
+          model,
+          contents: params.contents,
+          config: Object.keys(config).length > 0 ? config : undefined,
+        });
+        const text = response.text?.trim();
+        if (text) {
+          return { text, model, response };
+        }
+        throw new Error(`Empty response from ${model}`);
+      } catch (err: any) {
+        lastError = err;
+        const msg = String(err?.message || err);
+        console.warn(`[Gemini] ${model} attempt ${attempt + 1} failed:`, msg);
+
+        // Don't retry auth/key errors
+        if (
+          msg.includes("API_KEY_INVALID") ||
+          msg.includes("PERMISSION_DENIED") ||
+          msg.includes("GEMINI_API_KEY is not configured")
+        ) {
+          throw err;
+        }
+        // Only retry transient errors once on the same model
+        const isTransient =
+          err?.status === 429 ||
+          err?.status === 500 ||
+          err?.status === 503 ||
+          msg.includes("RESOURCE_EXHAUSTED") ||
+          msg.includes("UNAVAILABLE") ||
+          msg.includes("fetch failed");
+        if (!isTransient || attempt === 1) {
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
+      }
+    }
+  }
+
+  throw lastError || new Error("All Gemini models failed to respond.");
+}
+
 // API Health Check
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok", time: new Date().toISOString() });
+});
+
+// Download Backend Structure Zip
+app.get("/api/download-backend-zip", (req, res) => {
+  const zipPath = path.join(process.cwd(), "public", "tracksy-backend.zip");
+  res.download(zipPath, "tracksy-backend-structure.zip", (err) => {
+    if (err) {
+      console.error("Download Zip Error:", err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: "Failed to download zip file." });
+      }
+    }
+  });
 });
 
 // Google OAuth Login URL endpoint
@@ -96,10 +250,10 @@ app.get("/api/auth/google/callback", async (req, res) => {
     });
     const userData = await userRes.json();
 
-    const name = userData.name || userData.given_name || (userData.email ? userData.email.split('@')[0] : 'Google User');
-    const email = userData.email || 'user@gmail.com';
-    const avatarUrl = userData.picture || '';
-    const handle = `@${email.split('@')[0]}`;
+    const name = userData.name || userData.given_name || (userData.email ? userData.email.split("@")[0] : "Google User");
+    const email = userData.email || "user@gmail.com";
+    const avatarUrl = userData.picture || "";
+    const handle = `@${email.split("@")[0]}`;
 
     const html = `
       <!DOCTYPE html>
@@ -146,22 +300,38 @@ app.get("/api/auth/google/callback", async (req, res) => {
 // AI Insights endpoint
 app.post("/api/ai-insights", async (req, res) => {
   try {
-    const { expenses, subscriptions, totalBudget } = req.body;
+    const { expenses = [], subscriptions = [], totalBudget = 10000 } = req.body || {};
     const ai = getGeminiClient();
 
-    const prompt = `Analyze this user's monthly budget and expense data:
-Total Monthly Budget: ₹${totalBudget || 10000}
-Subscriptions: ${JSON.stringify(subscriptions || [])}
-Expenses: ${JSON.stringify(expenses || [])}
+    // Pre-compute accurate category totals to ground the AI analysis
+    const categoryTotals: Record<string, number> = {};
+    for (const s of subscriptions) {
+      if (s?.active !== false) {
+        const cat = s?.category || "Other";
+        categoryTotals[cat] = (categoryTotals[cat] || 0) + (Number(s?.amount) || 0);
+      }
+    }
+    for (const e of expenses) {
+      const cat = e?.category || "Other";
+      categoryTotals[cat] = (categoryTotals[cat] || 0) + (Number(e?.amount) || 0);
+    }
+    const grandTotal = Object.values(categoryTotals).reduce((a, b) => a + b, 0);
 
-Provide a JSON object with:
-1. summary: A 2-3 sentence personalized financial analysis and spending prediction.
-2. topCategories: An array of top spending categories with name, amount, percentage, and icon.
-3. healthScore: An integer from 0 to 100 rating their financial health.
-4. recommendations: An array of 3 actionable financial saving tips.`;
+    const prompt = `Analyze this user's monthly budget and expense data in Indian Rupees (₹):
+Total Monthly Budget: ₹${Number(totalBudget)}
+Total Combined Spend (Expenses + Active Subscriptions): ₹${grandTotal}
+Budget Utilization: ${totalBudget > 0 ? ((grandTotal / totalBudget) * 100).toFixed(1) : 0}%
+Pre-computed Category Totals: ${JSON.stringify(categoryTotals)}
+Active Subscriptions: ${JSON.stringify(subscriptions.slice(0, 20))}
+Recent Expenses: ${JSON.stringify(expenses.slice(0, 40))}
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.6-flash",
+Return a JSON object with:
+1. summary: A specific 2-3 sentence personalized financial analysis and spending prediction citing their actual ₹ figures and top merchants/categories.
+2. topCategories: An array of top spending categories based strictly on the Pre-computed Category Totals (with name, amount, percentage, and icon emoji).
+3. healthScore: An integer from 0 to 100 rating their financial health based on budget utilization and spending balance.
+4. recommendations: An array of 3 concrete, actionable financial saving tips tailored to their actual expenses.`;
+
+    const { text, model } = await generateContentWithFallback(ai, {
       contents: prompt,
       config: {
         responseMimeType: "application/json",
@@ -179,7 +349,7 @@ Provide a JSON object with:
                   percentage: { type: Type.NUMBER },
                   icon: { type: Type.STRING },
                 },
-                required: ["name", "amount", "percentage"],
+                required: ["name", "amount", "percentage", "icon"],
               },
             },
             healthScore: { type: Type.INTEGER },
@@ -193,41 +363,56 @@ Provide a JSON object with:
       },
     });
 
-    const result = JSON.parse(response.text || "{}");
-    res.json({ success: true, data: result });
+    const result = safeParseJson(text);
+    res.json({ success: true, data: result, engine: model });
   } catch (error: any) {
     console.error("AI Insights Error:", error);
-    res.status(500).json({
+    const { status, message } = formatGeminiError(error);
+    res.status(status).json({
       success: false,
-      error: error.message || "Failed to generate AI insights.",
+      error: message,
     });
   }
 });
 
-// Scan Receipt Endpoint
+// Scan Receipt Endpoint with Gemini Vision OCR
 app.post("/api/scan-receipt", async (req, res) => {
   try {
-    const { imageBase64, mimeType = "image/jpeg" } = req.body;
-    if (!imageBase64) {
-      return res.status(400).json({ error: "Missing imageBase64 payload" });
+    const { imageBase64, mimeType = "image/jpeg" } = req.body || {};
+    if (!imageBase64 || typeof imageBase64 !== "string") {
+      return res.status(400).json({ success: false, error: "Missing imageBase64 payload." });
+    }
+
+    // Detect actual MIME type from data URL if present (prevents MIME mismatches after canvas JPEG conversion)
+    const dataUrlMatch = imageBase64.match(/^data:([^;]+);base64,/i);
+    const resolvedMimeType = (dataUrlMatch?.[1] || mimeType || "image/jpeg").split(";")[0].trim();
+    const cleanBase64 = imageBase64.replace(/^data:.*?;base64,/i, "").trim();
+
+    if (!cleanBase64) {
+      return res.status(400).json({ success: false, error: "Empty base64 image data." });
     }
 
     const ai = getGeminiClient();
 
-    const imagePart = {
-      inlineData: {
-        data: imageBase64.replace(/^data:image\/\w+;base64,/, ""),
-        mimeType: mimeType,
+    const { text, model } = await generateContentWithFallback(ai, {
+      contents: {
+        parts: [
+          {
+            inlineData: {
+              mimeType: resolvedMimeType,
+              data: cleanBase64,
+            },
+          },
+          {
+            text: `You are an expert OCR receipt parsing assistant. Carefully inspect this receipt, bill, or invoice image and extract:
+1. merchant: The store, cafe, restaurant, or business name printed on the receipt.
+2. amount: The final total payable / net payable / grand total amount as a positive number (do not include currency symbols).
+3. category: Strictly one of: Food, Transport, Shopping, Bills, Entertainment, Health, Travel, Other.
+4. note: A brief 1-sentence summary of the key items purchased or service billed.
+5. date: The receipt date in YYYY-MM-DD format if visible, otherwise today's date (${new Date().toISOString().split("T")[0]}).`,
+          },
+        ],
       },
-    };
-
-    const textPart = {
-      text: "Analyze this receipt image and extract: merchant name, total amount in ₹ (INR), date if available, best fitting category (Food, Transport, Shopping, Bills, Entertainment, Health, Travel, Other), and a short note summary.",
-    };
-
-    const response = await ai.models.generateContent({
-      model: "gemini-3.6-flash",
-      contents: { parts: [imagePart, textPart] },
       config: {
         responseMimeType: "application/json",
         responseSchema: {
@@ -244,105 +429,333 @@ app.post("/api/scan-receipt", async (req, res) => {
       },
     });
 
-    const parsed = JSON.parse(response.text || "{}");
-    res.json({ success: true, data: parsed });
+    const parsed = safeParseJson(text);
+    const normalized = {
+      merchant: String(parsed?.merchant || "").trim() || "Scanned Receipt",
+      amount: Number(parsed?.amount) || 0,
+      category: normalizeCategory(parsed?.category),
+      note: String(parsed?.note || "").trim(),
+      date: String(parsed?.date || new Date().toISOString().split("T")[0]).trim(),
+    };
+
+    return res.json({
+      success: true,
+      data: normalized,
+      engine: model,
+    });
   } catch (error: any) {
     console.error("Scan Receipt Error:", error);
-    res.status(500).json({
+    const { status, message } = formatGeminiError(error);
+    res.status(status).json({
       success: false,
-      error: error.message || "Failed to analyze receipt image.",
+      error: message,
     });
   }
 });
 
-// Voice Parse Endpoint
-app.post("/api/voice-parse", async (req, res) => {
-  try {
-    const { transcript } = req.body;
-    if (!transcript) {
-      return res.status(400).json({ error: "Transcript is required" });
-    }
-
-    const ai = getGeminiClient();
-
-    const response = await ai.models.generateContent({
-      model: "gemini-3.6-flash",
-      contents: `Parse the following spoken spending statement into structured expense fields:
+// Helper to parse an expense transcript into structured JSON using Gemini
+async function parseExpenseTranscript(ai: GoogleGenAI, transcript: string) {
+  const { text, model } = await generateContentWithFallback(ai, {
+    contents: `Parse the following spoken spending statement into structured expense fields:
 "${transcript}"
 
-Extract amount (numeric in ₹), category (choose best match from: Food, Transport, Shopping, Bills, Entertainment, Health, Travel, Other), merchant name, and brief note.`,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            amount: { type: Type.NUMBER },
-            category: { type: Type.STRING },
-            merchant: { type: Type.STRING },
-            note: { type: Type.STRING },
-          },
-          required: ["amount", "category"],
+Extract:
+- amount: numeric amount spent (positive number in ₹, e.g. 450). If no amount is mentioned, return 0.
+- category: strictly one of Food, Transport, Shopping, Bills, Entertainment, Health, Travel, Other.
+- merchant: store, brand, restaurant, or service name mentioned (e.g. Starbucks, Uber, Netflix, DMart). Leave empty if not mentioned.
+- note: a short clean description of what was bought or paid for.`,
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          amount: { type: Type.NUMBER },
+          category: { type: Type.STRING },
+          merchant: { type: Type.STRING },
+          note: { type: Type.STRING },
         },
+        required: ["amount", "category"],
       },
-    });
+    },
+  });
 
-    const parsed = JSON.parse(response.text || "{}");
-    res.json({ success: true, data: parsed });
+  const parsed = safeParseJson(text);
+  return {
+    data: {
+      amount: Number(parsed?.amount) || 0,
+      category: normalizeCategory(parsed?.category),
+      merchant: String(parsed?.merchant || "").trim(),
+      note: String(parsed?.note || "").trim(),
+    },
+    engine: model,
+  };
+}
+
+// Helper to transcribe base64 audio via Gemini (gemini-3.5-transcribe with fallback to gemini-4-hydrogen)
+async function transcribeAudioBase64(ai: GoogleGenAI, audioBase64: string, mimeType: string) {
+  const dataUrlMatch = audioBase64.match(/^data:([^;]+);base64,/i);
+  const resolvedMimeType = (dataUrlMatch?.[1] || mimeType || "audio/webm").split(";")[0].trim();
+  const cleanBase64 = audioBase64.replace(/^data:.*?;base64,/i, "").trim();
+
+  if (!cleanBase64) {
+    throw new Error("Empty audio recording received.");
+  }
+
+  const audioPart = {
+    inlineData: {
+      mimeType: resolvedMimeType,
+      data: cleanBase64,
+    },
+  };
+
+  // Try dedicated audio transcription model first, then general multimodal fallback
+  const modelsToTry = [TRANSCRIBE_MODEL, PRIMARY_MODEL, FALLBACK_MODEL];
+  let lastError: any = null;
+
+  for (const model of modelsToTry) {
+    try {
+      const config =
+        model === PRIMARY_MODEL
+          ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+          : undefined;
+      const response = await ai.models.generateContent({
+        model,
+        contents: {
+          parts: [
+            audioPart,
+            {
+              text: "Transcribe the spoken words accurately into clean plain text. Return only the transcription with no extra commentary.",
+            },
+          ],
+        },
+        config,
+      });
+      const transcript = response.text?.trim();
+      if (transcript) {
+        return { transcript, model };
+      }
+    } catch (err: any) {
+      lastError = err;
+      const msg = String(err?.message || err);
+      console.warn(`[Voice Transcribe] ${model} warning:`, msg);
+      if (
+        msg.includes("API_KEY_INVALID") ||
+        msg.includes("PERMISSION_DENIED") ||
+        msg.includes("GEMINI_API_KEY is not configured")
+      ) {
+        throw err;
+      }
+    }
+  }
+
+  throw lastError || new Error("Could not transcribe audio. Please speak clearly and try again.");
+}
+
+// Voice Text Parse Endpoint
+app.post("/api/voice-parse", async (req, res) => {
+  try {
+    const { transcript } = req.body || {};
+    if (!transcript || !String(transcript).trim()) {
+      return res.status(400).json({ success: false, error: "Transcript is required." });
+    }
+
+    const ai = getGeminiClient();
+    const { data, engine } = await parseExpenseTranscript(ai, String(transcript).trim());
+    res.json({ success: true, data, transcript: String(transcript).trim(), engine });
   } catch (error: any) {
     console.error("Voice Parse Error:", error);
-    res.status(500).json({
+    const { status, message } = formatGeminiError(error);
+    res.status(status).json({
       success: false,
-      error: error.message || "Failed to parse voice transcript.",
+      error: message,
     });
   }
 });
 
-// AI Chat Bot Endpoint for AI Insights
-app.post("/api/ai-chat", async (req, res) => {
+// Voice Audio Transcription Endpoint (used by AI Chat Bot microphone input)
+app.post("/api/voice-transcribe", async (req, res) => {
   try {
-    const { message, history = [], financialContext } = req.body;
-    if (!message) {
-      return res.status(400).json({ error: "Message prompt is required" });
+    const { audioBase64, mimeType = "audio/webm" } = req.body || {};
+    if (!audioBase64 || typeof audioBase64 !== "string") {
+      return res.status(400).json({ success: false, error: "Audio data is required." });
     }
 
     const ai = getGeminiClient();
+    const { transcript, model } = await transcribeAudioBase64(ai, audioBase64, mimeType);
+    res.json({ success: true, transcript, engine: model });
+  } catch (error: any) {
+    console.error("Voice Transcribe Error:", error);
+    const { status, message } = formatGeminiError(error);
+    res.status(status).json({
+      success: false,
+      error: message,
+    });
+  }
+});
 
-    const systemInstruction = `You are Tracksy AI, a smart, empathetic, and highly analytical personal financial advisor bot.
-Your role is to analyze the user's finances, answer questions, provide spending insights, suggest budget saving strategies, and give actionable financial advice.
+// Voice Audio Expense Endpoint (transcribes audio + extracts structured expense fields)
+app.post("/api/voice-expense", async (req, res) => {
+  try {
+    const { audioBase64, mimeType = "audio/webm" } = req.body || {};
+    if (!audioBase64 || typeof audioBase64 !== "string") {
+      return res.status(400).json({ success: false, error: "Audio data is required." });
+    }
 
-Current Financial Context:
-- Overall Monthly Budget: ₹${financialContext?.overallBudget || 0}
-- Total Spent So Far: ₹${financialContext?.grandTotal || 0}
-- Category Spending Totals: ${JSON.stringify(financialContext?.categoryTotals || {})}
-- Active Subscriptions: ${JSON.stringify(financialContext?.subscriptions || [])}
-- Recent Expenses: ${JSON.stringify(financialContext?.recentTransactions || [])}
+    const ai = getGeminiClient();
+    const { transcript, model: transcribeEngine } = await transcribeAudioBase64(
+      ai,
+      audioBase64,
+      mimeType
+    );
+    const { data, engine: parseEngine } = await parseExpenseTranscript(ai, transcript);
 
-Instructions:
-- Be clear, conversational, helpful, and concise (2-4 sentences or formatted bullet points).
-- Always use INR (₹) symbol when mentioning amounts.
-- Give personalized insights directly referencing their actual spending data when appropriate.`;
+    res.json({
+      success: true,
+      transcript,
+      data,
+      engine: `${transcribeEngine} + ${parseEngine}`,
+    });
+  } catch (error: any) {
+    console.error("Voice Expense Error:", error);
+    const { status, message } = formatGeminiError(error);
+    res.status(status).json({
+      success: false,
+      error: message,
+    });
+  }
+});
 
-    const chat = ai.chats.create({
-      model: "gemini-3.6-flash",
+// AI Chat Bot Endpoint for AI Insights & Comprehensive Expense Analysis
+app.post("/api/ai-chat", async (req, res) => {
+  try {
+    const { message, history = [], financialContext } = req.body || {};
+    if (!message || !String(message).trim()) {
+      return res.status(400).json({ success: false, error: "Message prompt is required." });
+    }
+
+    const budget: number = Number(financialContext?.overallBudget) || 10000;
+    const spent: number = Number(financialContext?.grandTotal) || 0;
+    const remaining: number = Math.max(0, budget - spent);
+    const burnPercent: string = budget > 0 ? ((spent / budget) * 100).toFixed(1) : "0";
+
+    const transactions: any[] = financialContext?.recentTransactions || financialContext?.transactions || [];
+    const subscriptions: any[] = financialContext?.subscriptions || [];
+    const categoryTotals: Record<string, number> = financialContext?.categoryTotals || {};
+
+    // Compute key financial metrics
+    const sortedByAmount = [...transactions].sort((a, b) => (Number(b.amount) || 0) - (Number(a.amount) || 0));
+    const highestTx = sortedByAmount.length > 0 ? sortedByAmount[0] : null;
+    const lowestTx = sortedByAmount.length > 0 ? sortedByAmount[sortedByAmount.length - 1] : null;
+
+    // Aggregate merchant totals
+    const merchantMap: Record<string, { total: number; count: number; category: string }> = {};
+    for (const tx of transactions) {
+      const name = (tx.merchant || tx.title || "General Merchant").trim();
+      if (!merchantMap[name]) {
+        merchantMap[name] = { total: 0, count: 0, category: tx.category || "Other" };
+      }
+      merchantMap[name].total += Number(tx.amount) || 0;
+      merchantMap[name].count += 1;
+    }
+
+    const topMerchants = Object.entries(merchantMap)
+      .sort((a, b) => b[1].total - a[1].total)
+      .slice(0, 8);
+
+    const categoryListText = Object.entries(categoryTotals)
+      .map(([cat, amt]) => `• ${cat}: ₹${Number(amt).toLocaleString("en-IN")} (${spent > 0 ? ((amt / spent) * 100).toFixed(1) : 0}% of spend)`)
+      .join("\n");
+
+    const merchantListText = topMerchants
+      .map(([name, data]) => `• ${name}: ₹${data.total.toLocaleString("en-IN")} (${data.count} transaction${data.count > 1 ? "s" : ""}, ${data.category})`)
+      .join("\n");
+
+    const subsListText = subscriptions
+      .map((s: any) => `• ${s.name}: ₹${Number(s.amount).toLocaleString("en-IN")}/month (${s.category})`)
+      .join("\n");
+
+    const txListText = transactions
+      .slice(0, 40)
+      .map((t: any) => `• ${t.date || "Recent"}: ₹${Number(t.amount).toLocaleString("en-IN")} at ${t.merchant || t.title || "Unknown"} [${t.category}]${t.note ? ` - "${t.note}"` : ""}`)
+      .join("\n");
+
+    const activeSubsMonthly = subscriptions.reduce((acc: number, s: any) => acc + (Number(s.amount) || 0), 0);
+    const activeSubsYearly = activeSubsMonthly * 12;
+
+    const systemInstruction = `You are Tracksy AI, an expert, friendly, and highly analytical personal financial advisor.
+Your role is to analyze the user's spending data and provide accurate, direct, and actionable answers to ANY question they ask about their expenses, budget, merchants, categories, or savings.
+
+=== LIVE USER FINANCIAL DATA (100% ACCURATE REAL-TIME) ===
+• Monthly Budget: ₹${budget.toLocaleString("en-IN")}
+• Total Spent: ₹${spent.toLocaleString("en-IN")} (${burnPercent}% of budget)
+• Remaining Balance: ₹${remaining.toLocaleString("en-IN")}
+• Total Transactions Logged: ${transactions.length}
+• Highest Expense: ${highestTx ? `₹${Number(highestTx.amount).toLocaleString("en-IN")} at ${highestTx.merchant || highestTx.title || "Unknown"} (${highestTx.category}, ${highestTx.date}${highestTx.note ? ` - ${highestTx.note}` : ""})` : "None logged"}
+• Lowest Expense: ${lowestTx ? `₹${Number(lowestTx.amount).toLocaleString("en-IN")} at ${lowestTx.merchant || lowestTx.title || "Unknown"} (${lowestTx.category}, ${lowestTx.date})` : "None logged"}
+• Active Subscriptions: ₹${activeSubsMonthly.toLocaleString("en-IN")}/month (₹${activeSubsYearly.toLocaleString("en-IN")}/year across ${subscriptions.length} services)
+
+=== SPENDING BY CATEGORY ===
+${categoryListText || "• No categorized expenses yet."}
+
+=== TOP MERCHANTS & VENUES ===
+${merchantListText || "• No merchant records yet."}
+
+=== ACTIVE SUBSCRIPTIONS ===
+${subsListText || "• No active subscriptions."}
+
+=== DETAILED TRANSACTION LOG ===
+${txListText || "• No transaction logs recorded yet."}
+
+=== INSTRUCTIONS FOR ANSWERING ===
+1. ANSWER DIRECTLY: Always address the specific question first with the exact figures from the data above before offering extra insights.
+2. MERCHANT QUERIES: If the user asks about a specific merchant (e.g., "Starbucks", "Uber", "Swiggy", "Amazon"), check the transaction log, sum their total spent on that merchant, and cite the individual purchases and dates.
+3. CATEGORY QUERIES: If asked about Food, Transport, Shopping, Bills, etc., state the exact category total, its proportion of overall spending, and the biggest items.
+4. HIGHEST / LOWEST: Cite the exact merchant name, amount, category, and date.
+5. AFFORDABILITY: If asked "Can I afford ₹X?" or "Can I buy X?", calculate the impact on their remaining ₹${remaining.toLocaleString("en-IN")} balance and advise whether it is financially safe.
+6. SAVINGS & BUDGETING: Give concrete, customized tips based on where they spend the most.
+7. FORMATTING: Use INR (₹) symbol. Keep responses concise, structured with bullet points and bold formatting for key numbers.`;
+
+    // Sanitize multi-turn history so roles start with 'user' and strictly alternate
+    const contents: Array<{ role: "user" | "model"; parts: Array<{ text: string }> }> = [];
+    for (const item of Array.isArray(history) ? history : []) {
+      if (!item || typeof item.content !== "string" || !item.content.trim()) continue;
+      const role: "user" | "model" = item.role === "user" ? "user" : "model";
+      if (contents.length === 0 && role !== "user") continue;
+      const prev = contents[contents.length - 1];
+      if (prev && prev.role === role) {
+        prev.parts[0].text += `\n${item.content.trim()}`;
+      } else {
+        contents.push({ role, parts: [{ text: item.content.trim() }] });
+      }
+    }
+
+    const currentText = String(message).trim();
+    const lastEntry = contents[contents.length - 1];
+    if (lastEntry && lastEntry.role === "user") {
+      lastEntry.parts[0].text += `\n${currentText}`;
+    } else {
+      contents.push({ role: "user", parts: [{ text: currentText }] });
+    }
+
+    const ai = getGeminiClient();
+    const { text: botReply, model: usedEngine } = await generateContentWithFallback(ai, {
+      contents,
       config: {
         systemInstruction,
       },
     });
 
-    for (const item of history) {
-      if (item.role === 'user' && item.content) {
-        await chat.sendMessage({ message: item.content });
-      }
-    }
-
-    const response = await chat.sendMessage({ message: message });
-    res.json({ success: true, reply: response.text });
+    return res.json({
+      success: true,
+      reply: botReply,
+      engine: usedEngine,
+    });
   } catch (error: any) {
     console.error("AI Chat Error:", error);
-    res.json({
+    const { status, message } = formatGeminiError(error);
+    res.status(status).json({
       success: false,
-      reply: "I'm having trouble retrieving AI insights right now. Please try again shortly!",
-      error: error.message,
+      error: message,
     });
   }
 });

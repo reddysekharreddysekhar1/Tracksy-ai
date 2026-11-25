@@ -1,0 +1,129 @@
+{
+  "info": {
+    "name": "Tracksy Backend API Collection",
+    "description": "Comprehensive Postman collection for Tracksy Expense Tracker Backend endpoints",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Health Check",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/health",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "health"]
+        }
+      }
+    },
+    {
+      "name": "Scan Receipt OCR",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"imageBase64\": \"data:image/jpeg;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==\",\n  \"mimeType\": \"image/jpeg\",\n  \"fileName\": \"starbucks.jpg\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/scan-receipt",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "scan-receipt"]
+        }
+      }
+    },
+    {
+      "name": "Voice Expense Parser",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"transcript\": \"Spent 450 rupees on dinner at Dominos Pizza\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/voice-parse",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "voice-parse"]
+        }
+      }
+    },
+    {
+      "name": "AI Spending Insights",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"totalBudget\": 20000,\n  \"expenses\": [\n    { \"category\": \"Food\", \"amount\": 1500, \"merchant\": \"Supermarket\" }\n  ],\n  \"subscriptions\": [\n    { \"name\": \"Spotify\", \"amount\": 119 }\n  ]\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/ai-insights",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "ai-insights"]
+        }
+      }
+    },
+    {
+      "name": "AI Advisor Chat",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"message\": \"How can I cut my monthly expenses by 15%?\",\n  \"financialContext\": {\n    \"overallBudget\": 15000,\n    \"grandTotal\": 7500\n  }\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/ai-chat",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "ai-chat"]
+        }
+      }
+    },
+    {
+      "name": "Get All Expenses",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/expenses",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "expenses"]
+        }
+      }
+    },
+    {
+      "name": "Create New Expense",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"amount\": 850,\n  \"category\": \"Food\",\n  \"merchant\": \"Chai Point\",\n  \"note\": \"Evening snacks\",\n  \"location\": \"MG Road\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/expenses",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "expenses"]
+        }
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:5000"
+    }
+  ]
+}
